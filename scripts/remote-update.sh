@@ -75,7 +75,7 @@ trap cleanup_lock EXIT
 # the update scripts only take effect on the next run.
 # run.py --cron is then called with --no-pull to skip the redundant pull.
 # Capture SHA before pull so we can detect whether code actually changed.
-BEFORE_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+BEFORE_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD || echo "")
 
 echo "[update] Pulling latest changes..."
 if git -C "$PROJECT_DIR" pull --ff-only 2>&1; then
@@ -84,7 +84,7 @@ else
     echo "[update] WARN: git pull failed or had conflicts — continuing with current code"
 fi
 
-AFTER_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+AFTER_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD || echo "")
 
 # ── Check for Python venv ────────────────────────────────────────────
 PYTHON="$PROJECT_DIR/.venv/bin/python"
@@ -148,18 +148,19 @@ WORKER_DST="$HOME/Library/LaunchAgents/${WORKER_LABEL}.plist"
 if [ -f "$WORKER_PLIST" ] && [ -f "$WORKER_DST" ]; then
     sed "s|__PROJECT_DIR__|$PROJECT_DIR|g; s|__HOME_DIR__|$HOME|g; s|__SERVICE_LABEL__|$WORKER_LABEL|g" "$WORKER_PLIST" > "$WORKER_DST"
 
-    NEED_RESTART=false
+    NEED_RESTART="false"
     if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
         # Check whether the diff touches directories/files the worker loads.
-        if git -C "$PROJECT_DIR" diff "$BEFORE_SHA" "$AFTER_SHA" -- \
+        if git -C "$PROJECT_DIR" diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- \
             worker/ agent/ mcp_servers/ models/ tools/ bridge/ reflections/ \
-            pyproject.toml | grep -q . ; then
-            NEED_RESTART=true
+            scripts/ config/ .claude/ pyproject.toml uv.lock \
+            com.valor.worker.plist | grep -q "" ; then
+            NEED_RESTART="true"
         fi
     fi
 
     if launchctl list | grep -q "$WORKER_LABEL"; then
-        if $NEED_RESTART; then
+        if [ "$NEED_RESTART" = "true" ]; then
             # Service is loaded — use kickstart -k to atomically kill+restart without
             # the bootout/bootstrap race condition (bootstrap error 5: label still registered).
             if ! launchctl kickstart -k "gui/$(id -u)/$WORKER_LABEL" 2>/dev/null; then

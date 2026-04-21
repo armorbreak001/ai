@@ -135,6 +135,146 @@ class TestRemoteUpdateScript:
         assert len(lines) > 0, "Expected at least one line of output"
 
 
+
+    def test_worker_kickstart_skipped_when_no_commits_pulled(self):
+        """When SHAs match (no commits pulled), kickstart should be skipped.
+
+        Sets up shim `git` and `launchctl` in temp dirs on PATH so that:
+        - `git rev-parse HEAD` returns the same SHA before/after pull
+        - `git pull --ff-only` reports "Already up to date"
+        - `launchctl list` returns as if worker is loaded
+        - Asserts NO `kickstart -k` invocation occurs.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir = Path(tmpdir) / "bin"
+            bin_dir.mkdir()
+
+            # Create launchctl shim that logs calls
+            launchctl_log = Path(tmpdir) / "launchctl.log"
+            launchctl_shim = bin_dir / "launchctl"
+            launchctl_shim.write_text(
+                f'#!/bin/bash\necho "$*" >> "{launchctl_log}"\n'
+                f'# Return "loaded" for list queries\n'
+                f'if [ "$1" = "list" ]; then echo "com.valor.worker"; exit 0; fi\n'
+                f'exit 0\n'
+            )
+            launchctl_shim.chmod(0o755)
+
+            # Create git shims
+            fixed_sha = "abc123def456"
+            git_shim = bin_dir / "git"
+            git_shim.write_text(
+                f'#!/bin/bash\n'
+                f'if [ "$1" = "-C" ] && [ "$2" != "" ]; then shift 2; fi\n'
+                f'case "$1" in\n'
+                f'  rev-parse) echo "{fixed_sha}";;\n'
+                f'  pull) echo "Already up to date.";;\n'
+                f'  diff) exit 1;;  # no diff paths -> grep gets empty input;;\n'
+                f'  *) exit 0;;\n'
+                f'esac\n'
+            )
+            git_shim.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
+            env_tmp = tempfile.mkdtemp()
+            env["HOME"] = env_tmp
+
+            result = subprocess.run(
+                ["bash", self.SCRIPT],
+                cwd=str(PROJECT_DIR),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+
+            launchctl_calls = launchctl_log.read_text() if launchctl_log.exists() else ""
+            assert (
+                "kickstart" not in launchctl_calls
+            ), f"Expected no kickstart, got: {launchctl_calls}"
+            assert (
+                "skipping restart" in result.stdout.lower() or "skipping kickstart" in result.stdout.lower()
+                or "up to date" in result.stdout.lower()
+            ), f"Expected skip message, got stdout: {result.stdout[:500]}"
+
+    def test_worker_kickstart_fires_when_worker_code_changed(self):
+        """When diff touches worker/, kickstart -k should fire.
+
+        Sets up shim `git` and `launchctl` in temp dirs on PATH so that:
+        - `git rev-parse HEAD` returns different SHAs before/after pull
+        - `git diff --name-only` returns a path matching worker-relevant glob
+        - `launchctl list` returns as if worker is loaded
+        - Asserts `kickstart -k` IS invoked.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir = Path(tmpdir) / "bin"
+            bin_dir.mkdir()
+
+            # Create launchctl shim that logs calls
+            launchctl_log = Path(tmpdir) / "launchctl.log"
+            launchctl_shim = bin_dir / "launchctl"
+            launchctl_shim.write_text(
+                f'#!/bin/bash\necho "$*" >> "{launchctl_log}"\n'
+                f'# Return "loaded" for list queries\n'
+                f'if [ "$1" = "list" ]; then echo "com.valor.worker"; exit 0; fi\n'
+                f'exit 0\n'
+            )
+            launchctl_shim.chmod(0o755)
+
+            before_sha = "aaa111bbb222"
+            after_sha = "ccc333ddd444"
+            git_shim = bin_dir / "git"
+            git_shim.write_text(
+                f'#!/bin/bash\n'
+                f'if [ "$1" = "-C" ] && [ "$2" != "" ]; then shift 2; fi\n'
+                f'case "$1" in\n'
+                f'  rev-parse)\n'
+                f'    if [ -f "{tmpdir}/post_pull" ]; then\n'
+                f'      echo "{after_sha}"\n'
+                f'    else\n'
+                f'      echo "{before_sha}"\n'
+                f'    fi\n'
+                f'    ;;\n'
+                f'  pull)\n'
+                f'    touch "{tmpdir}/post_pull"\n'
+                f'    echo "Fast-forward"\n'
+                f'    ;;\n'
+                f'  diff)\n'
+                f'    shift  # remove --name-only and SHAs\n'
+                f'    echo "worker/__main__.py"\n'
+                f'    ;;\n'
+                f'  *) exit 0;;\n'
+                f'esac\n'
+            )
+            git_shim.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
+            env_tmp = tempfile.mkdtemp()
+            env["HOME"] = env_tmp
+
+            result = subprocess.run(
+                ["bash", self.SCRIPT],
+                cwd=str(PROJECT_DIR),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+
+            launchctl_calls = launchctl_log.read_text() if launchctl_log.exists() else ""
+            assert (
+                "kickstart" in launchctl_calls
+            ), f"Expected kickstart invocation, got: {launchctl_calls}"
+            assert (
+                "-k" in launchctl_calls
+            ), f"Expected kickstart -k, got: {launchctl_calls}"
+
 # =============================================================================
 # Restart Flag Tests
 # =============================================================================

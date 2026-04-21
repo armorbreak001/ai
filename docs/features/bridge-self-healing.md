@@ -590,6 +590,51 @@ rm data/auto-revert-enabled
 - **No external services** - Self-contained recovery
 - **Minimal file-based state** - Flood-backoff and last-connected use simple files in `data/` for cross-restart persistence; all other state in Redis
 
+
+## Gated Worker Restarts
+
+The 30-minute `com.valor.update` cron (via `remote-update.sh`) **only** restarts the worker when the pulled commits touch code that the worker actually loads. This prevents long-running SDLC pipelines and local dev sessions from being SIGTERM'd every 30 minutes on quiet cycles.
+
+### How It Works
+
+1. `remote-update.sh` captures `BEFORE_SHA` and `AFTER_SHA` around the `git pull`
+2. If SHAs differ, it runs `git diff --name-only` against a **worker-relevance glob**
+3. Only if the diff matches the glob does `launchctl kickstart -k` fire
+4. On first install (service not yet loaded), bootstrap always runs unconditionally
+
+### Worker-Relevance Glob
+
+Paths that trigger a worker restart:
+
+| Path | Reason |
+|------|--------|
+| `worker/` | Worker main entrypoint and session handling |
+| `agent/` | Agent modules loaded by worker (SDK client, session executor, memory) |
+| `mcp_servers/` | MCP server integrations invoked by agent |
+| `models/` | Data models used throughout |
+| `tools/` | Tool definitions loaded at runtime |
+| `bridge/` | Bridge communication layer |
+| `reflections/` | Reflection processing |
+| `scripts/` | CLI subprocesses spawned by worker (`scripts.popoto_index_cleanup`, etc.) |
+| `config/` | Settings imported by agent modules in 5+ files |
+| `.claude/` | CLI hooks invoked by worker via harness |
+| `pyproject.toml` / `uv.lock` | Dependency changes |
+| `com.valor.worker.plist` | Plist template changes |
+
+### Log Lines
+
+- **Restart fired**: `[update]` (implicit — kickstart happens silently)
+- **Restart skipped**: `[update] No worker-relevant changes detected — skipping restart`
+
+### Manual Override
+
+To force a worker restart outside the cron cycle:
+```bash
+./scripts/valor-service.sh worker-restart
+# or via Telegram: /update
+```
+
+
 ## Related
 
 - [Message Pipeline](message-pipeline.md) — deferred enrichment and zero-loss restart mechanisms
