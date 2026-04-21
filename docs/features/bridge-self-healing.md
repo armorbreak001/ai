@@ -244,6 +244,27 @@ tail -f logs/update.log
 
 **Manual override**: The Telegram `/update` command continues to work for immediate updates.
 
+### 13b. Gated Worker Restarts (issue #1091)
+
+**Problem**: The 30-minute `com.valor.update` cron unconditionally ran `launchctl kickstart -k` on every invocation, restarting the worker whether or not anything changed. Long-running SDLC pipelines (build + test + review) were SIGTERM'd every 30 minutes, and local dev sessions were abandoned on each restart.
+
+**Solution**: `scripts/remote-update.sh` now captures `BEFORE_SHA` before `git pull` and `AFTER_SHA` after the orchestrator (`run.py --cron`) returns — so auto-bump commits to `pyproject.toml` are included. The worker kickstart is gated on a `worker_code_changed()` shell function that checks:
+
+1. `BEFORE_SHA != AFTER_SHA` (any commit landed), **and**
+2. The diff touches at least one worker-relevant path:
+   - `worker/`, `agent/`, `mcp_servers/`, `models/`, `tools/`, `bridge/`, `reflections/`
+   - `scripts/` (worker spawns CLI subprocesses)
+   - `config/` (runtime-loaded settings)
+   - `.claude/` (hooks, skills invoked by Claude Code CLI)
+   - `pyproject.toml`, `uv.lock`
+   - `com.valor.worker.plist`
+
+When neither condition is met, the script logs `[update] No worker-relevant changes detected — skipping restart` and skips the kickstart entirely. First-time installs (service not yet loaded) still bootstrap unconditionally.
+
+**SIGPIPE safety**: The diff check uses a variable-capture pattern (`changed_paths=$(git diff ...)` then `grep -qE ... <<< "$changed_paths"`) instead of a pipeline. This avoids a SIGPIPE hazard under `set -euo pipefail` where `grep -q` exiting early would kill the upstream `git diff`.
+
+**Force a manual restart**: `./scripts/valor-service.sh worker-restart` or `python scripts/update/run.py --full`.
+
 ### 14. Bridge Hibernation (`bridge/hibernation.py`)
 
 **Problem**: The bridge has no distinction between two fundamentally different failure modes:

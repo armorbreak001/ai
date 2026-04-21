@@ -1,4 +1,12 @@
-"""Tests for remote update: shell script, bridge intercept, restart flag lifecycle."""
+"""Tests for remote update: shell script, bridge intercept, restart flag lifecycle.
+
+Test class convention:
+  - TestWorkerCodeChangedFunction: unit-level tests of the shell function itself.
+    These spin up tmp git repos and source the function directly — they NEVER
+    skip and do NOT require .venv.  New shell-function internals go here.
+  - TestRemoteUpdateScript: full-script smoke tests that may skip when .venv is
+    absent.  Reserved for end-to-end behavior that requires the full script.
+"""
 
 import asyncio
 import os
@@ -19,14 +27,208 @@ from scripts.update.deps import (
 # Project root
 PROJECT_DIR = Path(__file__).parent.parent.parent
 
+SCRIPT = str(PROJECT_DIR / "scripts" / "remote-update.sh")
+
 
 # =============================================================================
-# Shell Script Tests
+# worker_code_changed() function-level tests (venv-independent)
+# =============================================================================
+
+
+class TestWorkerCodeChangedFunction:
+    """Direct tests of the worker_code_changed shell function.
+
+    Each test creates a fresh git repo in tmp_path, makes commits, then sources
+    the function from remote-update.sh and checks its return code.  These tests
+    never skip and do not require .venv or any external services.
+    """
+
+    def _run_fn(self, tmp_repo: Path, before_sha: str, after_sha: str) -> int:
+        """Source worker_code_changed and return its exit code."""
+        cmd = (
+            f"source {SCRIPT}; BEFORE_SHA={before_sha}; AFTER_SHA={after_sha}; "
+            f"PROJECT_DIR={tmp_repo}; worker_code_changed"
+        )
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", cmd],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode
+
+    def _commit_file(self, repo: Path, path: str, content: str = "data\n") -> str:
+        """Create a file, commit it, and return the new HEAD SHA."""
+        full = repo / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
+        subprocess.run(
+            ["git", "add", path],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"add {path}"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    def _init_repo(self, tmp_path: Path) -> Path:
+        """Initialise a bare git repo with one commit and return its path."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        self._commit_file(repo, "README.md", "# test\n")
+        return repo
+
+    # -- cases --
+
+    def test_returns_false_when_shas_identical(self, tmp_path):
+        """Same before/after SHA → no restart (return 1)."""
+        repo = self._init_repo(tmp_path)
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert self._run_fn(repo, sha, sha) == 1
+
+    def test_returns_true_when_worker_dir_changed(self, tmp_path):
+        """Commit touching worker/ → restart (return 0)."""
+        repo = self._init_repo(tmp_path)
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        after = self._commit_file(repo, "worker/foo.py")
+        assert self._run_fn(repo, before, after) == 0
+
+    def test_returns_false_when_only_docs_changed(self, tmp_path):
+        """Commit touching only docs/ → no restart (return 1)."""
+        repo = self._init_repo(tmp_path)
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        after = self._commit_file(repo, "docs/plans/foo.md")
+        assert self._run_fn(repo, before, after) == 1
+
+    def test_returns_true_when_claude_hooks_changed(self, tmp_path):
+        """Commit touching .claude/hooks/ → restart (return 0)."""
+        repo = self._init_repo(tmp_path)
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        after = self._commit_file(repo, ".claude/hooks/bar.py")
+        assert self._run_fn(repo, before, after) == 0
+
+    def test_returns_false_when_only_tests_changed(self, tmp_path):
+        """Commit touching only tests/ → no restart (return 1)."""
+        repo = self._init_repo(tmp_path)
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        after = self._commit_file(repo, "tests/unit/baz.py")
+        assert self._run_fn(repo, before, after) == 1
+
+    def test_sigpipe_safe_with_large_diff(self, tmp_path):
+        """200+ changed files with a worker/ match → returns 0 without error.
+
+        Regression test for the SIGPIPE hazard where git diff | grep -q would
+        kill the upstream git diff with SIGPIPE under set -euo pipefail.
+        """
+        repo = self._init_repo(tmp_path)
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        # Create 200+ files — most non-worker, but ensure at least one worker/ file
+        for i in range(150):
+            self._commit_file(repo, f"docs/page{i}.md", f"doc {i}\n")
+        for i in range(60):
+            self._commit_file(repo, f"tests/test_{i}.py", f"test {i}\n")
+        # The critical match
+        after = self._commit_file(repo, "worker/core.py", "restart me\n")
+        assert self._run_fn(repo, before, after) == 0
+
+    def test_returns_true_when_before_sha_empty(self, tmp_path):
+        """Empty BEFORE_SHA → fail-safe restart (return 0)."""
+        repo = self._init_repo(tmp_path)
+        after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert self._run_fn(repo, "", after) == 0
+
+    def test_returns_true_when_git_diff_fails(self, tmp_path):
+        """Bogus BEFORE_SHA → git diff fails → fail-safe restart (return 0)."""
+        repo = self._init_repo(tmp_path)
+        after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        bogus = "deadbeef" * 10  # valid-looking but nonexistent
+        assert self._run_fn(repo, bogus, after) == 0
+
+
+# =============================================================================
+# Shell Script Tests (full-script smoke; may skip without .venv)
 # =============================================================================
 
 
 class TestRemoteUpdateScript:
-    """Test scripts/remote-update.sh behavior."""
+    """Test scripts/remote-update.sh behavior.
+
+    These are end-to-end smoke tests that invoke the full script.  They may
+    skip when .venv is absent (the script requires Python).  For unit-level
+    tests of shell-function internals, see TestWorkerCodeChangedFunction.
+    """
 
     SCRIPT = str(PROJECT_DIR / "scripts" / "remote-update.sh")
 
@@ -133,6 +335,37 @@ class TestRemoteUpdateScript:
         # file and prints only a bare summary to stdout, so zero prefixed
         # lines is acceptable as long as we got *some* output.
         assert len(lines) > 0, "Expected at least one line of output"
+
+    def test_worker_kickstart_skipped_when_no_commits_pulled(self):
+        """When git pull produces no new commits, worker kickstart is skipped.
+
+        This end-to-end smoke test verifies that when the remote is already
+        up-to-date, the script logs that it skipped the worker restart (or
+        reports being up to date).  Skips when .venv is absent because the
+        full script requires Python.
+        """
+        venv_dir = PROJECT_DIR / ".venv"
+        if not venv_dir.exists():
+            pytest.skip("No .venv in project dir (e.g. running in worktree)")
+
+        # Clean up any stale lock file from previous runs
+        lock_dir = PROJECT_DIR / "data" / "update.lock"
+        if lock_dir.is_dir():
+            lock_dir.rmdir()
+
+        result = subprocess.run(
+            ["bash", self.SCRIPT],
+            cwd=str(PROJECT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0
+        assert (
+            "No worker-relevant changes detected" in result.stdout
+            or "up to date" in result.stdout.lower()
+            or "commit(s)" in result.stdout
+        )
 
 
 

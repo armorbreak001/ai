@@ -11,6 +11,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 LOCK_DIR="$PROJECT_DIR/data/update.lock"
 
+# ── worker_code_changed() ──────────────────────────────────────────
+# Defined early so unit tests can source this script without executing
+# the main body.  Returns 0 ("true" in bash-if) when the worker should be
+# restarted, 1 ("false") when safe to skip.  SIGPIPE-safe: diff output is
+# captured into a variable before grep reads it.
+# Reads BEFORE_SHA, AFTER_SHA, PROJECT_DIR from the calling environment.
+worker_code_changed() {
+    # Unknown baseline → fail-safe: restart.
+    if [ -z "$BEFORE_SHA" ]; then
+        return 0
+    fi
+    # No new commits → skip restart.
+    if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+        return 1
+    fi
+    # Capture diff output into a variable (no pipe, no SIGPIPE hazard).
+    local changed_paths
+    local rc=0
+    changed_paths=$(git -C "$PROJECT_DIR" diff --name-only "$BEFORE_SHA" "$AFTER_SHA" 2>/dev/null) || rc=$?
+    # git diff failed → fail-safe: restart.
+    if [ $rc -ne 0 ]; then
+        return 0
+    fi
+    # Here-string feeds grep from a pre-populated buffer — no live upstream to SIGPIPE.
+    grep -qE '^(worker/|agent/|mcp_servers/|models/|tools/|bridge/|reflections/|scripts/|config/|\.claude/|com\.valor\.worker\.plist$|pyproject\.toml$|uv\.lock$)' <<< "$changed_paths"
+}
+
+# ── Guard: skip main body when sourced ─────────────────────────────
+# Unit tests source this file to get worker_code_changed() without
+# running git pull, venv checks, or launchd commands.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    return 0 2>/dev/null || true
+fi
+
 # ── Ensure .env → ~/Desktop/Valor/.env symlink ──────────────────────
 # The vault file is the single source of truth for secrets. On a fresh machine
 # or after accidental deletion, create the symlink before sourcing .env so the
@@ -148,19 +182,8 @@ WORKER_DST="$HOME/Library/LaunchAgents/${WORKER_LABEL}.plist"
 if [ -f "$WORKER_PLIST" ] && [ -f "$WORKER_DST" ]; then
     sed "s|__PROJECT_DIR__|$PROJECT_DIR|g; s|__HOME_DIR__|$HOME|g; s|__SERVICE_LABEL__|$WORKER_LABEL|g" "$WORKER_PLIST" > "$WORKER_DST"
 
-    NEED_RESTART="false"
-    if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
-        # Check whether the diff touches directories/files the worker loads.
-        if git -C "$PROJECT_DIR" diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- \
-            worker/ agent/ mcp_servers/ models/ tools/ bridge/ reflections/ \
-            scripts/ config/ .claude/ pyproject.toml uv.lock \
-            com.valor.worker.plist | grep -q "" ; then
-            NEED_RESTART="true"
-        fi
-    fi
-
     if launchctl list | grep -q "$WORKER_LABEL"; then
-        if [ "$NEED_RESTART" = "true" ]; then
+        if worker_code_changed; then
             # Service is loaded — use kickstart -k to atomically kill+restart without
             # the bootout/bootstrap race condition (bootstrap error 5: label still registered).
             if ! launchctl kickstart -k "gui/$(id -u)/$WORKER_LABEL" 2>/dev/null; then
